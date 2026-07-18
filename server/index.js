@@ -240,15 +240,34 @@ const server = http.createServer(async (req, res) => {
       const user = getUserFromAuth(req);
       if (!user) return json(res, 401, { error: 'unauthorized' });
       const body = await readJson(req);
-      const email = String(body.email || '')
-        .trim()
-        .toLowerCase();
-      const target = usersByEmail.get(email);
-      if (!target) return json(res, 404, { error: 'user not found — unhone pehle login kiya hona chahiye' });
-      if (target.id === user.id) return json(res, 400, { error: 'cannot friend yourself' });
+      let target = null;
+      if (body.userId) {
+        const e = emailById.get(body.userId);
+        target = e ? usersByEmail.get(e) : null;
+      } else {
+        const email = String(body.email || '')
+          .trim()
+          .toLowerCase();
+        target = usersByEmail.get(email);
+      }
+      if (!target) {
+        return json(res, 404, {
+          error: 'user not found — unhone pehle login kiya hona chahiye',
+        });
+      }
+      if (target.id === user.id) {
+        return json(res, 400, { error: 'cannot friend yourself' });
+      }
       if (user.friends.has(target.id)) {
         return json(res, 400, { error: 'already friends' });
       }
+      const exists = [...friendRequests.values()].some(
+        (r) =>
+          r.status === 'pending' &&
+          ((r.from === user.id && r.to === target.id) ||
+            (r.from === target.id && r.to === user.id)),
+      );
+      if (exists) return json(res, 400, { error: 'request already pending' });
       const id = uid();
       friendRequests.set(id, {
         id,
@@ -356,6 +375,13 @@ function leaveRoom(ws) {
   ws.roomCode = null;
 }
 
+function peerProfile(ws) {
+  if (!ws.userId) return null;
+  const email = emailById.get(ws.userId);
+  const u = email ? usersByEmail.get(email) : null;
+  return u ? publicUser(u) : null;
+}
+
 function tryMatch(ws) {
   if (waitingPeer === ws) return;
   if (waitingPeer && waitingPeer.readyState === waitingPeer.OPEN) {
@@ -369,8 +395,20 @@ function tryMatch(ws) {
     rooms.set(roomCode, room);
     other.roomCode = roomCode;
     ws.roomCode = roomCode;
-    send(other, { type: 'matched', peerId: other.peerId, initiator: false });
-    send(ws, { type: 'matched', peerId: ws.peerId, initiator: true });
+    send(other, {
+      type: 'matched',
+      peerId: other.peerId,
+      initiator: false,
+      peer: peerProfile(ws),
+      room: roomCode,
+    });
+    send(ws, {
+      type: 'matched',
+      peerId: ws.peerId,
+      initiator: true,
+      peer: peerProfile(other),
+      room: roomCode,
+    });
     console.log(`[match] ${other.peerId} <-> ${ws.peerId}`);
   } else {
     waitingPeer = ws;
@@ -423,9 +461,21 @@ wss.on('connection', (ws) => {
         room.set(ws.peerId, ws);
         ws.roomCode = roomCode;
         const isInitiator = room.size === MAX_PEERS;
-        send(ws, { type: 'joined', peerId: ws.peerId, initiator: isInitiator });
+        send(ws, {
+          type: 'joined',
+          peerId: ws.peerId,
+          initiator: isInitiator,
+          peer: isInitiator
+            ? peerProfile([...room.values()].find((p) => p.peerId !== ws.peerId))
+            : null,
+          room: roomCode,
+        });
         for (const [, peerWs] of otherPeers(roomCode, ws.peerId)) {
-          send(peerWs, { type: 'peer-joined', peerId: ws.peerId });
+          send(peerWs, {
+            type: 'peer-joined',
+            peerId: ws.peerId,
+            peer: peerProfile(ws),
+          });
         }
         break;
       }
