@@ -1,41 +1,337 @@
 /**
- * Signaling server for 1:1 WebRTC video calls.
- *
- * IMPORTANT: This server NEVER sees any audio/video data.
- * It only relays small text messages (SDP offers/answers and ICE candidates)
- * so that two phones can find each other. The actual call is peer-to-peer
- * and encrypted end-to-end with DTLS-SRTP (mandatory in WebRTC).
+ * FLASH signaling + auth + friends + chat API
+ * Media never touches this server (WebRTC P2P only).
  */
 
 const http = require('http');
 const crypto = require('crypto');
+const { URL } = require('url');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
+const OTP_ECHO = process.env.OTP_ECHO !== '0'; // return OTP in JSON for easy testing
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 
-// roomCode -> Map<peerId, ws>
 const rooms = new Map();
-const MAX_PEERS_PER_ROOM = 2;
-
-// Random matchmaking queue (OmeTV style): one peer waits until another arrives.
+const MAX_PEERS = 2;
 let waitingPeer = null;
 
-const server = http.createServer((req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
+/** @type {Map<string, {id:string,email:string,name:string,picture?:string,friends:Set<string>,createdAt:number}>} */
+const usersByEmail = new Map();
+/** @type {Map<string, string>} userId -> email */
+const emailById = new Map();
+/** @type {Map<string, {userId:string,expires:number}>} */
+const sessions = new Map();
+/** @type {Map<string, {otp:string,expires:number}>} */
+const otps = new Map();
+/** @type {Map<string, {id:string,from:string,to:string,status:string}>} */
+const friendRequests = new Map();
+/** @type {Map<string, {id:string,from:string,to:string,text:string,at:number}[]>} */
+const chats = new Map(); // key: sorted pair id
+
+function uid() {
+  return crypto.randomUUID();
+}
+
+function token() {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+function chatKey(a, b) {
+  return [a, b].sort().join(':');
+}
+
+function getUserFromAuth(req) {
+  const h = req.headers.authorization || '';
+  const t = h.startsWith('Bearer ') ? h.slice(7) : '';
+  const s = sessions.get(t);
+  if (!s || s.expires < Date.now()) return null;
+  const email = emailById.get(s.userId);
+  return email ? usersByEmail.get(email) : null;
+}
+
+function ensureUser({ email, name, picture }) {
+  const key = email.toLowerCase();
+  let u = usersByEmail.get(key);
+  if (!u) {
+    u = {
+      id: uid(),
+      email: key,
+      name: name || key.split('@')[0],
+      picture: picture || '',
+      friends: new Set(),
+      createdAt: Date.now(),
+    };
+    usersByEmail.set(key, u);
+    emailById.set(u.id, key);
+  } else if (name) {
+    u.name = name;
+    if (picture) u.picture = picture;
+  }
+  return u;
+}
+
+function publicUser(u) {
+  return {
+    id: u.id,
+    email: u.email,
+    name: u.name,
+    picture: u.picture || '',
+  };
+}
+
+function cors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', (c) => {
+      raw += c;
+      if (raw.length > 1e6) reject(new Error('body too large'));
+    });
+    req.on('end', () => {
+      try {
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function json(res, code, body) {
+  cors(res);
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
+async function verifyGoogleIdToken(idToken) {
+  const url =
+    'https://oauth2.googleapis.com/tokeninfo?id_token=' +
+    encodeURIComponent(idToken);
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('invalid google token');
+  const data = await r.json();
+  if (GOOGLE_CLIENT_ID && data.aud !== GOOGLE_CLIENT_ID) {
+    throw new Error('google client mismatch');
+  }
+  if (!data.email || data.email_verified === 'false') {
+    throw new Error('email not verified');
+  }
+  return data;
+}
+
+const server = http.createServer(async (req, res) => {
+  cors(res);
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
     return;
   }
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Signaling server running. Connect via WebSocket.');
+
+  const url = new URL(req.url || '/', `http://${req.headers.host}`);
+  const path = url.pathname;
+
+  try {
+    if (path === '/health') {
+      return json(res, 200, {
+        ok: true,
+        rooms: rooms.size,
+        waiting: waitingPeer ? 1 : 0,
+        users: usersByEmail.size,
+      });
+    }
+
+    if (path === '/api/auth/request-otp' && req.method === 'POST') {
+      const body = await readJson(req);
+      const email = String(body.email || '')
+        .trim()
+        .toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return json(res, 400, { error: 'invalid email' });
+      }
+      const otp = String(Math.floor(100000 + Math.random() * 900000));
+      otps.set(email, { otp, expires: Date.now() + 10 * 60 * 1000 });
+      console.log(`[otp] ${email} => ${otp}`);
+      return json(res, 200, {
+        ok: true,
+        message: 'OTP generated',
+        ...(OTP_ECHO ? { demoOtp: otp } : {}),
+      });
+    }
+
+    if (path === '/api/auth/verify-otp' && req.method === 'POST') {
+      const body = await readJson(req);
+      const email = String(body.email || '')
+        .trim()
+        .toLowerCase();
+      const code = String(body.otp || '').trim();
+      const entry = otps.get(email);
+      if (!entry || entry.expires < Date.now() || entry.otp !== code) {
+        return json(res, 401, { error: 'invalid or expired otp' });
+      }
+      otps.delete(email);
+      const user = ensureUser({
+        email,
+        name: body.name || email.split('@')[0],
+      });
+      const t = token();
+      sessions.set(t, {
+        userId: user.id,
+        expires: Date.now() + 30 * 24 * 3600 * 1000,
+      });
+      return json(res, 200, { token: t, user: publicUser(user) });
+    }
+
+    if (path === '/api/auth/google' && req.method === 'POST') {
+      const body = await readJson(req);
+      const idToken = body.credential || body.idToken;
+      if (!idToken) return json(res, 400, { error: 'missing credential' });
+      const g = await verifyGoogleIdToken(idToken);
+      const user = ensureUser({
+        email: g.email,
+        name: g.name || g.email.split('@')[0],
+        picture: g.picture,
+      });
+      const t = token();
+      sessions.set(t, {
+        userId: user.id,
+        expires: Date.now() + 30 * 24 * 3600 * 1000,
+      });
+      return json(res, 200, { token: t, user: publicUser(user) });
+    }
+
+    if (path === '/api/me' && req.method === 'GET') {
+      const user = getUserFromAuth(req);
+      if (!user) return json(res, 401, { error: 'unauthorized' });
+      return json(res, 200, { user: publicUser(user) });
+    }
+
+    if (path === '/api/friends' && req.method === 'GET') {
+      const user = getUserFromAuth(req);
+      if (!user) return json(res, 401, { error: 'unauthorized' });
+      const list = [...user.friends]
+        .map((id) => {
+          const e = emailById.get(id);
+          return e ? publicUser(usersByEmail.get(e)) : null;
+        })
+        .filter(Boolean);
+      const incoming = [...friendRequests.values()]
+        .filter((r) => r.to === user.id && r.status === 'pending')
+        .map((r) => ({
+          id: r.id,
+          from: publicUser(usersByEmail.get(emailById.get(r.from))),
+        }));
+      const outgoing = [...friendRequests.values()]
+        .filter((r) => r.from === user.id && r.status === 'pending')
+        .map((r) => ({
+          id: r.id,
+          to: publicUser(usersByEmail.get(emailById.get(r.to))),
+        }));
+      return json(res, 200, { friends: list, incoming, outgoing });
+    }
+
+    if (path === '/api/friends/request' && req.method === 'POST') {
+      const user = getUserFromAuth(req);
+      if (!user) return json(res, 401, { error: 'unauthorized' });
+      const body = await readJson(req);
+      const email = String(body.email || '')
+        .trim()
+        .toLowerCase();
+      const target = usersByEmail.get(email);
+      if (!target) return json(res, 404, { error: 'user not found — unhone pehle login kiya hona chahiye' });
+      if (target.id === user.id) return json(res, 400, { error: 'cannot friend yourself' });
+      if (user.friends.has(target.id)) {
+        return json(res, 400, { error: 'already friends' });
+      }
+      const id = uid();
+      friendRequests.set(id, {
+        id,
+        from: user.id,
+        to: target.id,
+        status: 'pending',
+      });
+      return json(res, 200, { ok: true, requestId: id });
+    }
+
+    if (path === '/api/friends/accept' && req.method === 'POST') {
+      const user = getUserFromAuth(req);
+      if (!user) return json(res, 401, { error: 'unauthorized' });
+      const body = await readJson(req);
+      const reqId = body.requestId;
+      const fr = friendRequests.get(reqId);
+      if (!fr || fr.to !== user.id || fr.status !== 'pending') {
+        return json(res, 404, { error: 'request not found' });
+      }
+      fr.status = 'accepted';
+      user.friends.add(fr.from);
+      const fromEmail = emailById.get(fr.from);
+      const fromUser = usersByEmail.get(fromEmail);
+      fromUser.friends.add(user.id);
+      return json(res, 200, { ok: true });
+    }
+
+    if (path === '/api/chat' && req.method === 'GET') {
+      const user = getUserFromAuth(req);
+      if (!user) return json(res, 401, { error: 'unauthorized' });
+      const withId = url.searchParams.get('with');
+      if (!withId || !user.friends.has(withId)) {
+        return json(res, 403, { error: 'not friends' });
+      }
+      const key = chatKey(user.id, withId);
+      return json(res, 200, { messages: chats.get(key) || [] });
+    }
+
+    if (path === '/api/chat' && req.method === 'POST') {
+      const user = getUserFromAuth(req);
+      if (!user) return json(res, 401, { error: 'unauthorized' });
+      const body = await readJson(req);
+      const to = body.to;
+      const text = String(body.text || '').trim().slice(0, 2000);
+      if (!to || !text || !user.friends.has(to)) {
+        return json(res, 400, { error: 'invalid chat' });
+      }
+      const key = chatKey(user.id, to);
+      const list = chats.get(key) || [];
+      const msg = {
+        id: uid(),
+        from: user.id,
+        to,
+        text,
+        at: Date.now(),
+      };
+      list.push(msg);
+      if (list.length > 200) list.shift();
+      chats.set(key, list);
+      // Push to online sockets if bound to user
+      for (const client of wss.clients) {
+        if (client.userId === to && client.readyState === 1) {
+          send(client, { type: 'chat', message: msg });
+        }
+      }
+      return json(res, 200, { message: msg });
+    }
+
+    json(res, 200, {
+      ok: true,
+      service: 'flash-signaling',
+      tip: 'Connect via WebSocket; REST under /api/*',
+    });
+  } catch (e) {
+    console.error(e);
+    json(res, 500, { error: e.message || 'server error' });
+  }
 });
 
 const wss = new WebSocketServer({ server });
 
 function send(ws, msg) {
-  if (ws.readyState === ws.OPEN) {
-    ws.send(JSON.stringify(msg));
-  }
+  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
 }
 
 function otherPeers(roomCode, exceptId) {
@@ -50,16 +346,14 @@ function leaveRoom(ws) {
   const room = rooms.get(roomCode);
   if (room) {
     room.delete(peerId);
-    if (room.size === 0) {
-      rooms.delete(roomCode);
-    } else {
+    if (room.size === 0) rooms.delete(roomCode);
+    else {
       for (const [, peerWs] of room) {
         send(peerWs, { type: 'peer-left', peerId });
       }
     }
   }
   ws.roomCode = null;
-  console.log(`[leave] peer=${peerId} room=${roomCode} (rooms alive: ${rooms.size})`);
 }
 
 function tryMatch(ws) {
@@ -67,7 +361,6 @@ function tryMatch(ws) {
   if (waitingPeer && waitingPeer.readyState === waitingPeer.OPEN) {
     const other = waitingPeer;
     waitingPeer = null;
-
     const roomCode = 'RND-' + crypto.randomBytes(4).toString('hex').toUpperCase();
     const room = new Map([
       [other.peerId, other],
@@ -76,21 +369,19 @@ function tryMatch(ws) {
     rooms.set(roomCode, room);
     other.roomCode = roomCode;
     ws.roomCode = roomCode;
-
-    // The peer that was waiting receives the offer; the newcomer creates it.
     send(other, { type: 'matched', peerId: other.peerId, initiator: false });
     send(ws, { type: 'matched', peerId: ws.peerId, initiator: true });
-    console.log(`[match] ${other.peerId} <-> ${ws.peerId} room=${roomCode}`);
+    console.log(`[match] ${other.peerId} <-> ${ws.peerId}`);
   } else {
     waitingPeer = ws;
     send(ws, { type: 'waiting' });
-    console.log(`[queue] peer=${ws.peerId} waiting for a match`);
   }
 }
 
 wss.on('connection', (ws) => {
-  ws.peerId = crypto.randomUUID();
+  ws.peerId = uid();
   ws.isAlive = true;
+  ws.userId = null;
   ws.on('pong', () => (ws.isAlive = true));
 
   ws.on('message', (data) => {
@@ -102,6 +393,17 @@ wss.on('connection', (ws) => {
     }
 
     switch (msg.type) {
+      case 'auth': {
+        const s = sessions.get(msg.token || '');
+        if (s && s.expires > Date.now()) {
+          ws.userId = s.userId;
+          send(ws, { type: 'auth-ok', peerId: ws.peerId, userId: ws.userId });
+        } else {
+          send(ws, { type: 'auth-fail' });
+        }
+        break;
+      }
+
       case 'join': {
         const roomCode = String(msg.room || '').trim().toUpperCase();
         if (!/^[A-Z0-9-]{4,32}$/.test(roomCode)) {
@@ -109,43 +411,55 @@ wss.on('connection', (ws) => {
           return;
         }
         if (ws.roomCode) leaveRoom(ws);
-
         let room = rooms.get(roomCode);
         if (!room) {
           room = new Map();
           rooms.set(roomCode, room);
         }
-        if (room.size >= MAX_PEERS_PER_ROOM) {
+        if (room.size >= MAX_PEERS) {
           send(ws, { type: 'room-full' });
           return;
         }
-
         room.set(ws.peerId, ws);
         ws.roomCode = roomCode;
-
-        // The second peer to join becomes the "caller" (creates the offer).
-        const isInitiator = room.size === MAX_PEERS_PER_ROOM;
+        const isInitiator = room.size === MAX_PEERS;
         send(ws, { type: 'joined', peerId: ws.peerId, initiator: isInitiator });
-
-        for (const [id, peerWs] of otherPeers(roomCode, ws.peerId)) {
+        for (const [, peerWs] of otherPeers(roomCode, ws.peerId)) {
           send(peerWs, { type: 'peer-joined', peerId: ws.peerId });
         }
-        console.log(`[join] peer=${ws.peerId} room=${roomCode} size=${room.size}`);
         break;
       }
 
-      // Relay SDP/ICE to the other peer in the room. Payload is opaque to us.
       case 'offer':
       case 'answer':
       case 'ice': {
         if (!ws.roomCode) return;
         for (const [, peerWs] of otherPeers(ws.roomCode, ws.peerId)) {
-          send(peerWs, { type: msg.type, payload: msg.payload, from: ws.peerId });
+          send(peerWs, {
+            type: msg.type,
+            payload: msg.payload,
+            from: ws.peerId,
+          });
         }
         break;
       }
 
-      // Random matchmaking: find a stranger (also used as "Next" to skip).
+      case 'chat-room': {
+        // Text chat while in a random/private call room
+        if (!ws.roomCode) return;
+        const text = String(msg.text || '').trim().slice(0, 500);
+        if (!text) return;
+        for (const [, peerWs] of otherPeers(ws.roomCode, ws.peerId)) {
+          send(peerWs, {
+            type: 'chat-room',
+            text,
+            from: ws.peerId,
+            at: Date.now(),
+          });
+        }
+        break;
+      }
+
       case 'find': {
         if (ws.roomCode) leaveRoom(ws);
         tryMatch(ws);
@@ -155,6 +469,11 @@ wss.on('connection', (ws) => {
       case 'leave': {
         if (waitingPeer === ws) waitingPeer = null;
         leaveRoom(ws);
+        break;
+      }
+
+      case 'ping': {
+        send(ws, { type: 'pong', t: Date.now() });
         break;
       }
     }
@@ -170,7 +489,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Kill dead connections so rooms free up (e.g. app killed without 'leave').
 const heartbeat = setInterval(() => {
   for (const ws of wss.clients) {
     if (!ws.isAlive) {
@@ -180,10 +498,10 @@ const heartbeat = setInterval(() => {
     ws.isAlive = false;
     ws.ping();
   }
-}, 30_000);
+}, 25_000);
 
 wss.on('close', () => clearInterval(heartbeat));
 
 server.listen(PORT, () => {
-  console.log(`Signaling server listening on port ${PORT}`);
+  console.log(`FLASH server on :${PORT}`);
 });
