@@ -11,6 +11,8 @@ const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 8080;
 const OTP_ECHO = process.env.OTP_ECHO !== '0'; // return OTP in JSON for easy testing
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+/** Soft cap for concurrent WebSocket clients on this instance */
+const MAX_WS = Number(process.env.MAX_WS || 2000);
 
 const rooms = new Map();
 const MAX_PEERS = 2;
@@ -144,6 +146,8 @@ const server = http.createServer(async (req, res) => {
         rooms: rooms.size,
         waiting: waitingPeer ? 1 : 0,
         users: usersByEmail.size,
+        connections: wss.clients.size,
+        maxWs: MAX_WS,
       });
     }
 
@@ -347,7 +351,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, maxPayload: 256 * 1024 });
 
 function send(ws, msg) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
@@ -417,6 +421,14 @@ function tryMatch(ws) {
 }
 
 wss.on('connection', (ws) => {
+  if (wss.clients.size > MAX_WS) {
+    try {
+      ws.send(JSON.stringify({ type: 'error', message: 'Server busy — try again' }));
+    } catch (_) {}
+    ws.close(1013, 'busy');
+    return;
+  }
+
   ws.peerId = uid();
   ws.isAlive = true;
   ws.userId = null;
