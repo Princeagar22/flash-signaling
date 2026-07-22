@@ -7,8 +7,10 @@ const http = require('http');
 const crypto = require('crypto');
 const { URL } = require('url');
 const { WebSocketServer } = require('ws');
+const adminStore = require('./admin-store');
 
 const PORT = process.env.PORT || 8080;
+const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const OTP_ECHO = process.env.OTP_ECHO !== '0'; // return OTP in JSON for easy testing
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 /** Soft cap for concurrent WebSocket clients on this instance */
@@ -49,7 +51,50 @@ function getUserFromAuth(req) {
   const s = sessions.get(t);
   if (!s || s.expires < Date.now()) return null;
   const email = emailById.get(s.userId);
-  return email ? usersByEmail.get(email) : null;
+  const user = email ? usersByEmail.get(email) : null;
+  if (user && isUserBanned(user)) return null;
+  return user;
+}
+
+function isUserBanned(user) {
+  if (!user) return false;
+  return !!adminStore.isBanned({ email: user.email, userId: user.id });
+}
+
+function invalidateSessionsForUser(userId) {
+  for (const [tok, s] of sessions.entries()) {
+    if (s.userId === userId) sessions.delete(tok);
+  }
+  for (const client of wss.clients) {
+    if (client.userId === userId) {
+      try {
+        send(client, { type: 'error', reason: 'banned' });
+        client.close(4003, 'banned');
+      } catch (_) {}
+    }
+  }
+}
+
+function isAdmin(req) {
+  if (!ADMIN_SECRET) return false;
+  const h = req.headers['x-flash-admin'] || '';
+  const auth = req.headers.authorization || '';
+  const t = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  return t === ADMIN_SECRET || h === ADMIN_SECRET;
+}
+
+function adminOnly(req, res) {
+  if (!ADMIN_SECRET) {
+    json(res, 503, {
+      error: 'Admin disabled — set ADMIN_SECRET on the server',
+    });
+    return false;
+  }
+  if (!isAdmin(req)) {
+    json(res, 401, { error: 'invalid admin key' });
+    return false;
+  }
+  return true;
 }
 
 function ensureUser({ email, name, picture }) {
@@ -180,6 +225,12 @@ const server = http.createServer(async (req, res) => {
         return json(res, 401, { error: 'invalid or expired otp' });
       }
       otps.delete(email);
+      const banned = adminStore.isBanned({ email });
+      if (banned) {
+        return json(res, 403, {
+          error: banned.reason || 'This account is suspended',
+        });
+      }
       const user = ensureUser({
         email,
         name: body.name || email.split('@')[0],
@@ -197,6 +248,12 @@ const server = http.createServer(async (req, res) => {
       const idToken = body.credential || body.idToken;
       if (!idToken) return json(res, 400, { error: 'missing credential' });
       const g = await verifyGoogleIdToken(idToken);
+      const banned = adminStore.isBanned({ email: g.email });
+      if (banned) {
+        return json(res, 403, {
+          error: banned.reason || 'This account is suspended',
+        });
+      }
       const user = ensureUser({
         email: g.email,
         name: g.name || g.email.split('@')[0],
@@ -340,6 +397,148 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { message: msg });
     }
 
+    if (path === '/api/app-config' && req.method === 'GET') {
+      return json(res, 200, { config: adminStore.getPublicConfig() });
+    }
+
+    if (path === '/api/report' && req.method === 'POST') {
+      const body = await readJson(req);
+      const reason = String(body.reason || '').trim();
+      if (!reason) return json(res, 400, { error: 'reason required' });
+      const reporter = getUserFromAuth(req);
+      const report = adminStore.addReport({
+        id: uid(),
+        reporterId: reporter?.id || '',
+        reporterEmail: reporter?.email || String(body.reporterEmail || '').trim(),
+        reportedUserId: String(body.reportedUserId || '').trim(),
+        reportedEmail: String(body.reportedEmail || '').trim().toLowerCase(),
+        reason,
+        context: body.context || 'call',
+        room: String(body.room || '').trim(),
+      });
+      console.log('[report]', report.id, report.reportedEmail || report.reportedUserId);
+      return json(res, 200, { ok: true, id: report.id });
+    }
+
+    if (path.startsWith('/api/admin/')) {
+      if (!adminOnly(req, res)) return;
+
+      if (path === '/api/admin/stats' && req.method === 'GET') {
+        const pendingReports = adminStore
+          .listReports('pending')
+          .length;
+        return json(res, 200, {
+          connections: wss.clients.size,
+          rooms: rooms.size,
+          waiting: waitingPeer ? 1 : 0,
+          users: usersByEmail.size,
+          pendingReports,
+          maxWs: MAX_WS,
+        });
+      }
+
+      if (path === '/api/admin/config') {
+        if (req.method === 'GET') {
+          return json(res, 200, { config: adminStore.getPublicConfig() });
+        }
+        if (req.method === 'PATCH' || req.method === 'POST') {
+          const body = await readJson(req);
+          const config = adminStore.setConfig(body);
+          return json(res, 200, { config });
+        }
+      }
+
+      if (path === '/api/admin/reports' && req.method === 'GET') {
+        const status = url.searchParams.get('status') || '';
+        const reports = adminStore.listReports(status || null);
+        return json(res, 200, { reports });
+      }
+
+      const resolveMatch = path.match(
+        /^\/api\/admin\/reports\/([^/]+)\/resolve$/,
+      );
+      if (resolveMatch && req.method === 'POST') {
+        const body = await readJson(req);
+        const status = body.status || 'resolved';
+        const r = adminStore.resolveReport(resolveMatch[1], status, body.note);
+        if (!r) return json(res, 404, { error: 'report not found' });
+        if (body.banReported) {
+          const email = r.reportedEmail;
+          const userId = r.reportedUserId;
+          if (email || userId) {
+            adminStore.banUser({
+              email,
+              userId,
+              reason: 'Report: ' + (r.reason || '').slice(0, 200),
+              by: 'admin',
+            });
+            if (userId) invalidateSessionsForUser(userId);
+            else if (email) {
+              const u = usersByEmail.get(email.toLowerCase());
+              if (u) invalidateSessionsForUser(u.id);
+            }
+          }
+        }
+        return json(res, 200, { ok: true, report: r });
+      }
+
+      if (path === '/api/admin/users' && req.method === 'GET') {
+        const q = (url.searchParams.get('q') || '').trim().toLowerCase();
+        let list = [...usersByEmail.values()].map((u) => ({
+          ...publicUser(u),
+          createdAt: u.createdAt,
+          banned: !!adminStore.isBanned({ email: u.email, userId: u.id }),
+        }));
+        if (q) {
+          list = list.filter(
+            (u) =>
+              u.email.includes(q) ||
+              (u.name || '').toLowerCase().includes(q) ||
+              u.id.includes(q),
+          );
+        }
+        list.sort((a, b) => b.createdAt - a.createdAt);
+        return json(res, 200, { users: list.slice(0, 100) });
+      }
+
+      if (path === '/api/admin/bans' && req.method === 'GET') {
+        return json(res, 200, { bans: adminStore.listBans() });
+      }
+
+      if (path === '/api/admin/users/ban' && req.method === 'POST') {
+        const body = await readJson(req);
+        const email = String(body.email || '').trim().toLowerCase();
+        let userId = String(body.userId || '').trim();
+        if (!email && !userId) {
+          return json(res, 400, { error: 'email or userId required' });
+        }
+        if (email && !userId) {
+          const u = usersByEmail.get(email);
+          if (u) userId = u.id;
+        }
+        const entry = adminStore.banUser({
+          email,
+          userId,
+          reason: body.reason,
+          by: 'admin',
+        });
+        if (userId) invalidateSessionsForUser(userId);
+        return json(res, 200, { ok: true, ban: entry });
+      }
+
+      if (path === '/api/admin/users/unban' && req.method === 'POST') {
+        const body = await readJson(req);
+        const ok = adminStore.unbanUser({
+          email: body.email,
+          userId: body.userId,
+        });
+        if (!ok) return json(res, 404, { error: 'ban not found' });
+        return json(res, 200, { ok: true });
+      }
+
+      return json(res, 404, { error: 'unknown admin route' });
+    }
+
     json(res, 200, {
       ok: true,
       service: 'flash-signaling',
@@ -446,6 +645,13 @@ wss.on('connection', (ws) => {
       case 'auth': {
         const s = sessions.get(msg.token || '');
         if (s && s.expires > Date.now()) {
+          const email = emailById.get(s.userId);
+          const u = email ? usersByEmail.get(email) : null;
+          if (u && isUserBanned(u)) {
+            send(ws, { type: 'auth-fail', reason: 'banned' });
+            ws.close(4003, 'banned');
+            break;
+          }
           ws.userId = s.userId;
           send(ws, { type: 'auth-ok', peerId: ws.peerId, userId: ws.userId });
         } else {
@@ -455,6 +661,15 @@ wss.on('connection', (ws) => {
       }
 
       case 'join': {
+        const cfgJoin = adminStore.getPublicConfig();
+        if (cfgJoin.maintenance) {
+          send(ws, {
+            type: 'error',
+            reason: 'maintenance',
+            message: cfgJoin.maintenanceMessage,
+          });
+          return;
+        }
         const roomCode = String(msg.room || '').trim().toUpperCase();
         if (!/^[A-Z0-9-]{4,32}$/.test(roomCode)) {
           send(ws, { type: 'error', reason: 'invalid-room-code' });
@@ -523,6 +738,19 @@ wss.on('connection', (ws) => {
       }
 
       case 'find': {
+        const cfg = adminStore.getPublicConfig();
+        if (cfg.maintenance) {
+          send(ws, {
+            type: 'error',
+            reason: 'maintenance',
+            message: cfg.maintenanceMessage,
+          });
+          return;
+        }
+        if (cfg.randomMatchEnabled === false) {
+          send(ws, { type: 'error', reason: 'random-disabled' });
+          return;
+        }
         if (ws.roomCode) leaveRoom(ws);
         tryMatch(ws);
         break;
