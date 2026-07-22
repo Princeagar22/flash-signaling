@@ -12,57 +12,49 @@ const fs = require('fs');
 const path = require('path');
 
 const adminStore = (function() {
-  /**
- * Persistent admin data: bans, reports, remote app config.
- * Set ADMIN_DATA_PATH on Railway with a mounted volume for durability.
- */
+  const DATA_PATH =
+    process.env.ADMIN_DATA_PATH ||
+    path.join(__dirname, 'data', 'admin.json');
 
-
-
-
-const DATA_PATH =
-  process.env.ADMIN_DATA_PATH ||
-  path.join(__dirname, 'data', 'admin.json');
-
-const DEFAULT_CONFIG = {
-  maintenance: false,
-  maintenanceMessage:
-    'FLASH is under maintenance. Please try again in a few minutes.',
-  announcement: '',
-  requireLogin: false,
-  randomMatchEnabled: true,
-  minAppVersion: '',
-  minWebVersion: '',
-};
-
-function defaultData() {
-  return {
-    bans: {},
-    reports: [],
-    config: { ...DEFAULT_CONFIG },
+  const DEFAULT_CONFIG = {
+    maintenance: false,
+    maintenanceMessage: 'FLASH is under maintenance. Please try again in a few minutes.',
+    announcement: '',
+    requireLogin: false,
+    randomMatchEnabled: true,
+    minAppVersion: '',
+    minWebVersion: '',
+    updateUrl: '',
   };
-}
 
-function ensureDir(filePath) {
-  const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
-
-function load() {
-  try {
-    if (!fs.existsSync(DATA_PATH)) return defaultData();
-    const raw = fs.readFileSync(DATA_PATH, 'utf8');
-    const parsed = JSON.parse(raw);
+  function defaultData() {
     return {
-      bans: parsed.bans || {},
-      reports: Array.isArray(parsed.reports) ? parsed.reports : [],
-      config: { ...DEFAULT_CONFIG, ...(parsed.config || {}) },
+      bans: {},
+      reports: [],
+      config: { ...DEFAULT_CONFIG },
     };
-  } catch (e) {
-    console.error('[admin-store] load failed', e.message);
-    return defaultData();
   }
-}
+
+  function ensureDir(filePath) {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  }
+
+  function load() {
+    try {
+      if (!fs.existsSync(DATA_PATH)) return defaultData();
+      const raw = fs.readFileSync(DATA_PATH, 'utf8');
+      const parsed = JSON.parse(raw);
+      return {
+        bans: parsed.bans || {},
+        reports: Array.isArray(parsed.reports) ? parsed.reports : [],
+        config: { ...DEFAULT_CONFIG, ...(parsed.config || {}) },
+      };
+    } catch (e) {
+      console.error('[admin-store] load failed', e.message);
+      return defaultData();
+    }
+  }
 
 let data = load();
 let saveTimer = null;
@@ -736,6 +728,36 @@ const server = http.createServer(async (req, res) => {
           userId: body.userId,
         });
         if (!ok) return json(res, 404, { error: 'ban not found' });
+        return json(res, 200, { ok: true });
+      }
+
+      if (path === '/api/admin/users/warn' && req.method === 'POST') {
+        const body = await readJson(req);
+        const email = String(body.email || '').trim().toLowerCase();
+        let userId = String(body.userId || '').trim();
+        const msg = String(body.message || '').trim().slice(0, 500);
+
+        if (!msg) return json(res, 400, { error: 'warning message is required' });
+        if (!email && !userId) return json(res, 400, { error: 'email or userId required' });
+
+        if (email && !userId) {
+          const u = usersByEmail.get(email);
+          if (u) userId = u.id;
+        }
+
+        if (userId) {
+          let found = false;
+          for (const client of wss.clients) {
+            if (client.userId === userId && client.readyState === 1) {
+              send(client, { type: 'warning', message: msg });
+              found = true;
+            }
+          }
+          if (!found) return json(res, 404, { error: 'User is offline' });
+        } else {
+          return json(res, 404, { error: 'User not found' });
+        }
+        
         return json(res, 200, { ok: true });
       }
 
