@@ -181,10 +181,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-  const path = url.pathname;
-
   try {
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const path = url.pathname;
+
     if (path === '/health') {
       return json(res, 200, {
         ok: true,
