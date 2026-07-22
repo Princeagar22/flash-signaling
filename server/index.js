@@ -22,9 +22,9 @@ const adminStore = (function() {
     announcement: '',
     requireLogin: false,
     randomMatchEnabled: true,
-    minAppVersion: '',
+    minAppVersion: '1.0.1',
     minWebVersion: '',
-    updateUrl: '',
+    updateUrl: 'https://flash-signaling-production.up.railway.app/app-release.apk',
   };
 
   function defaultData() {
