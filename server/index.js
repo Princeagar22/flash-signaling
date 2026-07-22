@@ -792,6 +792,6 @@ const heartbeat = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeat));
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`FLASH server on 0.0.0.0:${PORT}`);
+server.listen(PORT, () => {
+  console.log(`FLASH server on :${PORT}`);
 });
