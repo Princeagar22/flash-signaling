@@ -204,6 +204,87 @@ function setConfig(partial) {
 })();
 
 
+const userStore = (function() {
+  const DATA_PATH = process.env.USER_DATA_PATH || path.join(__dirname, 'data', 'users.json');
+
+  function defaultData() {
+    return {
+      usersByEmail: {},
+      emailById: {},
+      sessions: {}
+    };
+  }
+
+  function ensureDir(filePath) {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  }
+
+  function load() {
+    try {
+      if (!fs.existsSync(DATA_PATH)) return defaultData();
+      const raw = fs.readFileSync(DATA_PATH, 'utf8');
+      const parsed = JSON.parse(raw);
+      
+      // Convert friends array to Set for each user
+      const usersByEmail = parsed.usersByEmail || {};
+      for (const email in usersByEmail) {
+        if (Array.isArray(usersByEmail[email].friends)) {
+          usersByEmail[email].friends = new Set(usersByEmail[email].friends);
+        } else {
+          usersByEmail[email].friends = new Set();
+        }
+      }
+      return {
+        usersByEmail,
+        emailById: parsed.emailById || {},
+        sessions: parsed.sessions || {}
+      };
+    } catch (e) {
+      console.error('[user-store] load failed', e.message);
+      return defaultData();
+    }
+  }
+
+  let data = load();
+  let saveTimer = null;
+
+  function persist() {
+    try {
+      ensureDir(DATA_PATH);
+      // Convert Set to Array before saving
+      const toSave = {
+        usersByEmail: {},
+        emailById: data.emailById,
+        sessions: data.sessions
+      };
+      for (const email in data.usersByEmail) {
+        toSave.usersByEmail[email] = {
+          ...data.usersByEmail[email],
+          friends: Array.from(data.usersByEmail[email].friends || [])
+        };
+      }
+      fs.writeFileSync(DATA_PATH, JSON.stringify(toSave, null, 2), 'utf8');
+    } catch (e) {
+      console.error('[user-store] save failed', e.message);
+    }
+  }
+
+  function saveSoon() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      persist();
+    }, 400);
+  }
+
+  return {
+    get data() { return data; },
+    saveSoon
+  };
+})();
+
+
 const PORT = process.env.PORT || 8080;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || '';
 const OTP_ECHO = process.env.OTP_ECHO !== '0'; // return OTP in JSON for easy testing
@@ -215,12 +296,9 @@ const rooms = new Map();
 const MAX_PEERS = 2;
 let waitingPeer = null;
 
-/** @type {Map<string, {id:string,email:string,name:string,picture?:string,friends:Set<string>,createdAt:number}>} */
-const usersByEmail = new Map();
-/** @type {Map<string, string>} userId -> email */
-const emailById = new Map();
-/** @type {Map<string, {userId:string,expires:number}>} */
-const sessions = new Map();
+// usersByEmail is now in userStore.data.usersByEmail
+// emailById is now in userStore.data.emailById
+// sessions is now in userStore.data.sessions
 /** @type {Map<string, {otp:string,expires:number}>} */
 const otps = new Map();
 /** @type {Map<string, {id:string,from:string,to:string,status:string}>} */
@@ -243,10 +321,10 @@ function chatKey(a, b) {
 function getUserFromAuth(req) {
   const h = req.headers.authorization || '';
   const t = h.startsWith('Bearer ') ? h.slice(7) : '';
-  const s = sessions.get(t);
+  const s = userStore.data.sessions[t];
   if (!s || s.expires < Date.now()) return null;
-  const email = emailById.get(s.userId);
-  const user = email ? usersByEmail.get(email) : null;
+  const email = userStore.data.emailById[s.userId];
+  const user = email ? userStore.data.usersByEmail[email] : null;
   if (user && isUserBanned(user)) return null;
   return user;
 }
@@ -257,8 +335,8 @@ function isUserBanned(user) {
 }
 
 function invalidateSessionsForUser(userId) {
-  for (const [tok, s] of sessions.entries()) {
-    if (s.userId === userId) sessions.delete(tok);
+  for (const [tok, s] of Object.entries(userStore.data.sessions)) {
+    if (s.userId === userId) (delete userStore.data.sessions[tok], userStore.saveSoon());
   }
   for (const client of wss.clients) {
     if (client.userId === userId) {
@@ -294,7 +372,7 @@ function adminOnly(req, res) {
 
 function ensureUser({ email, name, picture, age }) {
   const key = email.toLowerCase();
-  let u = usersByEmail.get(key);
+  let u = userStore.data.usersByEmail[key];
   if (!u) {
     u = {
       id: uid(),
@@ -305,8 +383,8 @@ function ensureUser({ email, name, picture, age }) {
       friends: new Set(),
       createdAt: Date.now(),
     };
-    usersByEmail.set(key, u);
-    emailById.set(u.id, key);
+    (userStore.data.usersByEmail[key] = u, userStore.saveSoon());
+    (userStore.data.emailById[u.id] = key, userStore.saveSoon());
   } else {
     if (name) u.name = name;
     if (age) u.age = age;
@@ -388,7 +466,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         rooms: rooms.size,
         waiting: waitingPeer ? 1 : 0,
-        users: usersByEmail.size,
+        users: Object.keys(userStore.data.usersByEmail).length,
         connections: wss.clients.size,
         maxWs: MAX_WS,
       });
@@ -435,10 +513,11 @@ const server = http.createServer(async (req, res) => {
         age: body.age || '',
       });
       const t = token();
-      sessions.set(t, {
+      userStore.data.sessions[t] = {
         userId: user.id,
         expires: Date.now() + 30 * 24 * 3600 * 1000,
-      });
+      };
+      userStore.saveSoon();
       return json(res, 200, { token: t, user: publicUser(user) });
     }
 
@@ -459,10 +538,11 @@ const server = http.createServer(async (req, res) => {
         picture: g.picture,
       });
       const t = token();
-      sessions.set(t, {
+      userStore.data.sessions[t] = {
         userId: user.id,
         expires: Date.now() + 30 * 24 * 3600 * 1000,
-      });
+      };
+      userStore.saveSoon();
       return json(res, 200, { token: t, user: publicUser(user) });
     }
 
@@ -477,21 +557,21 @@ const server = http.createServer(async (req, res) => {
       if (!user) return json(res, 401, { error: 'unauthorized' });
       const list = [...user.friends]
         .map((id) => {
-          const e = emailById.get(id);
-          return e ? publicUser(usersByEmail.get(e)) : null;
+          const e = userStore.data.emailById[id];
+          return e ? publicUser(userStore.data.usersByEmail[e]) : null;
         })
         .filter(Boolean);
       const incoming = [...friendRequests.values()]
         .filter((r) => r.to === user.id && r.status === 'pending')
         .map((r) => ({
           id: r.id,
-          from: publicUser(usersByEmail.get(emailById.get(r.from))),
+          from: publicUser(userStore.data.usersByEmail[userStore.data.emailById[r.from]]),
         }));
       const outgoing = [...friendRequests.values()]
         .filter((r) => r.from === user.id && r.status === 'pending')
         .map((r) => ({
           id: r.id,
-          to: publicUser(usersByEmail.get(emailById.get(r.to))),
+          to: publicUser(userStore.data.usersByEmail[userStore.data.emailById[r.to]]),
         }));
       return json(res, 200, { friends: list, incoming, outgoing });
     }
@@ -502,13 +582,13 @@ const server = http.createServer(async (req, res) => {
       const body = await readJson(req);
       let target = null;
       if (body.userId) {
-        const e = emailById.get(body.userId);
-        target = e ? usersByEmail.get(e) : null;
+        const e = userStore.data.emailById[body.userId];
+        target = e ? userStore.data.usersByEmail[e] : null;
       } else {
         const email = String(body.email || '')
           .trim()
           .toLowerCase();
-        target = usersByEmail.get(email);
+        target = userStore.data.usersByEmail[email];
       }
       if (!target) {
         return json(res, 404, {
@@ -549,8 +629,8 @@ const server = http.createServer(async (req, res) => {
       }
       fr.status = 'accepted';
       user.friends.add(fr.from);
-      const fromEmail = emailById.get(fr.from);
-      const fromUser = usersByEmail.get(fromEmail);
+      const fromEmail = userStore.data.emailById[fr.from];
+      const fromUser = userStore.data.usersByEmail[fromEmail];
       fromUser.friends.add(user.id);
       return json(res, 200, { ok: true });
     }
@@ -630,7 +710,7 @@ const server = http.createServer(async (req, res) => {
           connections: wss.clients.size,
           rooms: rooms.size,
           waiting: waitingPeer ? 1 : 0,
-          users: usersByEmail.size,
+          users: Object.keys(userStore.data.usersByEmail).length,
           pendingReports,
           maxWs: MAX_WS,
         });
@@ -673,7 +753,7 @@ const server = http.createServer(async (req, res) => {
             });
             if (userId) invalidateSessionsForUser(userId);
             else if (email) {
-              const u = usersByEmail.get(email.toLowerCase());
+              const u = userStore.data.usersByEmail[email.toLowerCase()];
               if (u) invalidateSessionsForUser(u.id);
             }
           }
@@ -683,7 +763,7 @@ const server = http.createServer(async (req, res) => {
 
       if (path === '/api/admin/users' && req.method === 'GET') {
         const q = (url.searchParams.get('q') || '').trim().toLowerCase();
-        let list = [...usersByEmail.values()].map((u) => ({
+        let list = Object.values(userStore.data.usersByEmail).map((u) => ({
           ...publicUser(u),
           createdAt: u.createdAt,
           banned: !!adminStore.isBanned({ email: u.email, userId: u.id }),
@@ -712,7 +792,7 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: 'email or userId required' });
         }
         if (email && !userId) {
-          const u = usersByEmail.get(email);
+          const u = userStore.data.usersByEmail[email];
           if (u) userId = u.id;
         }
         const entry = adminStore.banUser({
@@ -745,7 +825,7 @@ const server = http.createServer(async (req, res) => {
         if (!email && !userId) return json(res, 400, { error: 'email or userId required' });
 
         if (email && !userId) {
-          const u = usersByEmail.get(email);
+          const u = userStore.data.usersByEmail[email];
           if (u) userId = u.id;
         }
 
@@ -809,8 +889,8 @@ function leaveRoom(ws) {
 
 function peerProfile(ws) {
   if (!ws.userId) return null;
-  const email = emailById.get(ws.userId);
-  const u = email ? usersByEmail.get(email) : null;
+  const email = userStore.data.emailById[ws.userId];
+  const u = email ? userStore.data.usersByEmail[email] : null;
   return u ? publicUser(u) : null;
 }
 
@@ -872,10 +952,10 @@ wss.on('connection', (ws) => {
 
     switch (msg.type) {
       case 'auth': {
-        const s = sessions.get(msg.token || '');
+        const s = userStore.data.sessions[msg.token || ''];
         if (s && s.expires > Date.now()) {
-          const email = emailById.get(s.userId);
-          const u = email ? usersByEmail.get(email) : null;
+          const email = userStore.data.emailById[s.userId];
+          const u = email ? userStore.data.usersByEmail[email] : null;
           if (u && isUserBanned(u)) {
             send(ws, { type: 'auth-fail', reason: 'banned' });
             ws.close(4003, 'banned');
