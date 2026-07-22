@@ -181,7 +181,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const url = new URL(req.url || '/', `http://${req.headers.host}`);
+  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   const path = url.pathname;
 
   try {
@@ -792,6 +792,6 @@ const heartbeat = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeat));
 
-server.listen(PORT, () => {
-  console.log(`FLASH server on :${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`FLASH server on 0.0.0.0:${PORT}`);
 });
