@@ -1,0 +1,16 @@
+{
+  "name": "video-call-signaling-server",
+  "version": "1.0.0",
+  "description": "Self-hosted WebRTC signaling server for 1:1 encrypted video calls",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
